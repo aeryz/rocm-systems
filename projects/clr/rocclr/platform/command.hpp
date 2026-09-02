@@ -1821,6 +1821,8 @@ class AccumulateCommand : public Command {
   //! Commands of other queues that packets of this command wait on without a command of their
   //! own (DEBUG_CLR_GRAPH_FAST_LAUNCH), held until this command completes
   std::vector<Command*> held_commands_;
+  //! Keep retained graph command buffers alive until this launch completes.
+  std::vector<std::shared_ptr<device::GraphPm4Batch>> graph_pm4_batches_;
 
  public:
   AccumulateCommand(HostQueue& queue, const EventWaitList& eventWaitList = nullWaitList,
@@ -1871,6 +1873,12 @@ class AccumulateCommand : public Command {
       command->release();
     }
     held_commands_.clear();
+  }
+
+  void retainGraphPm4Batch(const std::shared_ptr<device::GraphPm4Batch>& batch) {
+    if (batch != nullptr) {
+      graph_pm4_batches_.push_back(batch);
+    }
   }
 
   //! Reserve one graph dispatch slot and return its index. |name| must not be
