@@ -90,6 +90,7 @@ size_t scan_into(int gfxip, const uint8_t* buf, size_t size, std::vector<QuickTo
     }
 
     auto scanner = (gfxip == 9) ? &quick_scan::scan_gfx9 : &scan_none;
+    if (gfxip == 11) scanner = &quick_scan::scan_gfx11;
     size_t ntokens = scanner(buf, size, raw.data(), raw.size());
     while (ntokens == raw.size())
     {
@@ -230,7 +231,7 @@ std::vector<StatusToken> build_rdna_status_tokens(const CSRegisterHandler& reg)
 std::vector<StatusToken> build_status_tokens(int gfxip, const CSRegisterHandler& reg)
 {
     if (gfxip == 9) return gfx9::build_standalone::build_status_tokens(reg);
-    if (gfxip == 12 || gfxip == 1250) return build_rdna_status_tokens(reg);
+    if (gfxip == 11 || gfxip == 12 || gfxip == 1250) return build_rdna_status_tokens(reg);
     return {};
 }
 
@@ -255,6 +256,7 @@ inline int extract_gfxip(uint64_t header)
 
     auto hw_header = mi400::header_type{.raw = header};
 
+    if (hw_header.version == 3) return 11;
     if (hw_header.version == 4) return 12;
     if (hw_header.version == 5) return 1250;
     return 0;
@@ -614,7 +616,7 @@ ROCPROF_TRACE_DECODER_API rocprofiler_thread_trace_decoder_status_t rocprof_trac
             return ROCPROFILER_THREAD_TRACE_DECODER_STATUS_ERROR_INVALID_ARGUMENT;
     }
 
-    if (gfxip != 9 && gfxip != 12 && gfxip != 1250)
+    if (gfxip != 9 && gfxip != 11 && gfxip != 12 && gfxip != 1250)
         return ROCPROFILER_THREAD_TRACE_DECODER_STATUS_ERROR_NOT_IMPLEMENTED;
 
     // Walk the prefix [0, offset_begin) through the private CSRegisterHandler
