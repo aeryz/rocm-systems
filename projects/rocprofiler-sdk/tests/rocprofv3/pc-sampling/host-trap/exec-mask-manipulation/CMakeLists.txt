@@ -16,11 +16,16 @@ find_package(rocprofiler-sdk REQUIRED)
 string(REPLACE "LD_PRELOAD=" "ROCPROF_PRELOAD=" PRELOAD_ENV
                "${ROCPROFILER_MEMCHECK_PRELOAD_ENV}")
 
+# The trap samples ~40 waves at once and costs tens of microseconds of GPU time, so the
+# 1 us minimum interval (which gfx11.5x accepts) turns this 1.5 s workload into ~10 s of
+# GPU time and ~10 M samples (~1.7 GB of CSV). 1 ms still gives every kernel hundreds of
+# samples and resolves both branch targets of the last kernel, which is what this fixture
+# asserts, without the volume.
 rocprofiler_add_integration_execute_test(
     rocprofv3-test-pc-sampling-host-trap-exec-mask-manipulation-input-cmd
     COMMAND
         $<TARGET_FILE:rocprofiler-sdk::rocprofv3> --pc-sampling-unit time
-        --pc-sampling-method host_trap --pc-sampling-interval 1 -d
+        --pc-sampling-method host_trap --pc-sampling-interval 1024 -d
         ${CMAKE_CURRENT_BINARY_DIR}/pc_sampling_cmd_input -o out --output-format csv json
         -- $<TARGET_FILE:exec-mask-manipulation>
     DEPENDS exec-mask-manipulation

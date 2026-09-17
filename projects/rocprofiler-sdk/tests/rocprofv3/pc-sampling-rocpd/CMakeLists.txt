@@ -201,7 +201,7 @@ rocprofiler_add_integration_execute_test(
         ${CMAKE_CURRENT_BINARY_DIR}/pc-sampling-rocpd-host-trap-input/capture-status.json
         -- $<TARGET_FILE:rocprofiler-sdk::rocprofv3> --pc-sampling-beta-enabled 1
         --kernel-trace --pc-sampling-unit time --pc-sampling-method host_trap
-        --pc-sampling-interval 1 -d
+        --pc-sampling-interval 1024 -d
         ${CMAKE_CURRENT_BINARY_DIR}/pc-sampling-rocpd-host-trap-input -o out
         --output-format rocpd json -- $<TARGET_FILE:exec-mask-manipulation>
     DEPENDS exec-mask-manipulation

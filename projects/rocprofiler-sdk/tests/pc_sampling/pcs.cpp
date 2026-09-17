@@ -413,8 +413,24 @@ process_sample(const PcSamplingRecordT*                      pc_sample,
     assert(corr_id.internal == corr_id.external.value);
     assert(corr_id.external.value > 0);
 
-    // Decoding the PC
-    auto inst = translator.get(pc_sample->pc.code_object_id, pc_sample->pc.code_object_offset);
+    // Decoding the PC. A sample does not always land on a decodable instruction: the
+    // hardware can report the PC one past the last instruction of the code object
+    // (e.g. for a wave that is completing), which maps to no instruction at all.
+    // Such a sample carries no instruction to attribute, so account for it as invalid
+    // instead of dereferencing a null instruction.
+    std::unique_ptr<address_translation::Instruction> inst{};
+    try
+    {
+        inst = translator.get(pc_sample->pc.code_object_id, pc_sample->pc.code_object_offset);
+    } catch(std::exception&)
+    {
+        // Disassembling an address that is not an instruction boundary throws.
+    }
+    if(inst == nullptr)
+    {
+        flat_profile.add_invalid_sample();
+        return;
+    }
     flat_profile.add_sample(std::move(inst), pc_sample->exec_mask);
 
     // TODO: introduce checks specific to stochastic sampling
