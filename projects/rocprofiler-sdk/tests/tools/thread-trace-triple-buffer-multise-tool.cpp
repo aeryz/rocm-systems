@@ -132,7 +132,14 @@ collect(rocprofiler_thread_trace_shader_data_t data, rocprofiler_user_data_t use
     chunk.end = (data.flags & ROCPROFILER_THREAD_TRACE_SHADER_DATA_FLAGS_END) != 0;
     // Supported GFX9/GFX12 hardware retires a full per-SE buffer on each swap.
     // Neither the small GFX9 header nor the final END/drain chunk counts as a swap.
-    chunk.retired_buffer = !chunk.end && data.data_size == GPU_BYTES_PER_SE;
+    // aqlprofile subtracts the minimal buffers reserved for the shader engines it does not trace
+    // from the per-SE capacity (4 KiB per engine on gfx10+), so a retired buffer can be a few
+    // KiB smaller than the requested size. The next active chunk after a swap carries the
+    // WPTR-derived size, which is far below this bound.
+    constexpr size_t RETIRED_SLACK = 64ul << 10;
+    chunk.retired_buffer =
+        !chunk.end && data.data_size + RETIRED_SLACK >= GPU_BYTES_PER_SE &&
+        data.data_size <= GPU_BYTES_PER_SE;
 
     auto& engine = *agent.engines.at(data.shader_engine_id);
     auto  lock   = std::lock_guard{engine.mutex};
@@ -206,7 +213,8 @@ validate()
             auto& engine = *agent->engines.at(se);
             if(engine.chunks.empty()) continue;  // A visible GPU may have been idle.
 
-            std::vector<char> bytes;
+            std::vector<char>   bytes;
+            std::vector<size_t> segment_ends;  // Absolute offsets of END chunks
             bytes.reserve(engine.byte_count);
             uint64_t next_index = 0;
             size_t   swaps      = 0;
@@ -215,7 +223,9 @@ validate()
             for(const auto& [index, chunk] : engine.chunks)
             {
                 require(index == next_index++, "missing chunk index");
-                require(!ended, "chunk received after END");
+                // END closes a trace segment. An overflow-recovery or startup retry drain ends
+                // one segment and the restarted trace opens the next, so a chunk may follow END.
+                if(ended) segment_ends.push_back(bytes.size());
                 ended = chunk.end;
                 swaps += chunk.retired_buffer;
                 stored = stored && (chunk.bytes != nullptr || chunk.size == 0);
@@ -228,11 +238,22 @@ validate()
             require(ended, "missing END chunk");
             engine.chunks.clear();
 
-            auto state      = parse_state_t{};
-            state.engine_id = se;
-            if(!bytes.empty())
-                check(rocprofiler_trace_decode(
-                          capture->decoder, parse, bytes.data(), bytes.size(), &state),
+            auto   state      = parse_state_t{};
+            state.engine_id   = se;
+            size_t segment_begin = 0;
+            for(size_t segment_end : segment_ends)
+            {
+                if(segment_end > segment_begin)
+                    check(rocprofiler_trace_decode(capture->decoder, parse,
+                                                   bytes.data() + segment_begin,
+                                                   segment_end - segment_begin, &state),
+                          "trace decode failed");
+                segment_begin = segment_end;
+            }
+            if(segment_begin < bytes.size())
+                check(rocprofiler_trace_decode(capture->decoder, parse,
+                                               bytes.data() + segment_begin,
+                                               bytes.size() - segment_begin, &state),
                       "trace decode failed");
             if(stored && state.has_pending) check_record(state, state.pending);
             std::cout << "GPU " << agent->id.handle << " SE " << se << ": " << state.records

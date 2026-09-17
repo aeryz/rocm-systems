@@ -485,15 +485,21 @@ ThreadTracerAgent::start_thread_trace_locked()
         for(size_t i = 0; i < worker_data->num_buffers; i++)
             worker_data->buffers[i].memory = worker_data->queue->cpu_buffers.at(i);
 
+        auto start_packets = control_packet_copy->before_krn_pkt;
+        ROCP_FATAL_IF(start_packets.empty()) << "ATT start packet list is empty";
         auto producer_data             = triple_buffer_producer_data_t{};
         producer_data.producer_running = worker_flag;
         producer_data.submit_signal    = std::move(producer_signal);
         producer_data.control_packet   = std::move(control_packet_copy);
         producer_data.copy_data_fn     = att_queue_copy;
         producer_data.shared           = worker_data;
-        // gfx9 restarts the trace after a GPU buffer overflow.
+        const auto* rocp_agent         = CHECK_NOTNULL(agent::get_agent(agent_id));
+        producer_data.gfx11_workarounds = ((rocp_agent->gfx_target_version / 10000) % 100) == 11;
+        // gfx9 restarts the trace after a GPU buffer overflow. gfx11 needs the same recovery:
+        // its per-CU trace window fills faster than a KFD re-arm round trip, so an overflow is
+        // routine there and the engine clears CTRL.MODE itself when it loses packets.
         producer_data.restart_on_gpu_full =
-            CHECK_NOTNULL(agent::get_agent(agent_id))->gfx_target_version < 100000;
+            rocp_agent->gfx_target_version < 100000 || producer_data.gfx11_workarounds;
         producer_data.buffer_packets = std::move(buffer_packets);
         producer_data.restart_trace  = [this](auto& snapshot) {
             auto snapshot_lock = std::unique_lock{trace_resources_mut};
@@ -503,7 +509,6 @@ ThreadTracerAgent::start_thread_trace_locked()
             snapshot->populate_after();
             return att_queue_submit_packets(*queue, snapshot->before_krn_pkt);
         };
-
         // Other call sites (kfd, internal_threading) wrap each std::thread
         // creation in its own pre/post pair, so match that convention.
         internal_threading::notify_pre_internal_thread_create(ROCPROFILER_LIBRARY);

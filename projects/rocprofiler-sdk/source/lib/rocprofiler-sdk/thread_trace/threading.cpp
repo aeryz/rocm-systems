@@ -168,7 +168,10 @@ producer_loop(
     const size_t num_buffers = parameters.shared->num_buffers;
     const auto   sqtt_bandwidth =
         std::max(1.0, common::get_env("ROCPROFILER_SQTT_BANDWIDTH", SQTT_BANDWIDTH_DEFAULT));
-    const auto interval_microseconds = static_cast<size_t>(1E6 * buffer_size / sqtt_bandwidth);
+    const auto estimated_fill_us   = static_cast<size_t>(1E6 * buffer_size / sqtt_bandwidth);
+    const auto polling_interval_us = parameters.gfx11_workarounds
+                                         ? std::max<size_t>(1, estimated_fill_us / 2)
+                                         : estimated_fill_us;
 
     auto buffer_packets = std::move(parameters.buffer_packets);
     for(auto& packet : buffer_packets)
@@ -178,6 +181,8 @@ producer_loop(
 
     auto   start_t0 = std::chrono::system_clock::now();
     bool   do_sleep{false};
+    bool   saw_buffer_swap{false};
+    bool   startup_retry_performed{false};
     size_t num_shader_engines = 0;
     for(const auto& packet : buffer_packets)
         num_shader_engines =
@@ -190,7 +195,9 @@ producer_loop(
 
     auto sleep_fn = [&]() {
         sched_yield();
-        std::this_thread::sleep_for(std::chrono::microseconds(interval_microseconds));
+        // Sub-millisecond sleeps routinely overshoot the buffer-fill window on Linux.
+        if(!parameters.gfx11_workarounds || polling_interval_us >= 1000)
+            std::this_thread::sleep_for(std::chrono::microseconds(polling_interval_us));
     };
 
     // Linear scan for any free (unfilled) slot. Returns num_buffers if none.
@@ -230,10 +237,16 @@ producer_loop(
         buffer.start_timestamp = start_ts;
         buffer.end_timestamp   = end_ts;
 
-        if(!isHeader)
-            parameters.copy_data_fn(queue, buffer.memory, src, size);
-        else
-            std::memcpy(buffer.memory, src, size);
+        // Preserve zero-length END callbacks as indexed segment boundaries, but
+        // do not submit a zero-byte copy: that operation may never signal
+        // completion and would deadlock producer shutdown.
+        if(size > 0)
+        {
+            if(!isHeader)
+                parameters.copy_data_fn(queue, buffer.memory, src, size);
+            else
+                std::memcpy(buffer.memory, src, size);
+        }
 
         auto copy_time = (std::chrono::system_clock::now() - t0).count() * 1E-9f;
         ROCP_TRACE << "Copy: " << copy_time << " s. BW: " << size / copy_time;
@@ -404,9 +417,19 @@ producer_loop(
         return true;
     };
 
+    auto startup_poll_deadline  = std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
+    auto startup_retry_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+
     while(worker_flag.load() == WORKER_FLAG_RUNNING)
     {
-        if(do_sleep) sleep_fn();
+        if(do_sleep)
+        {
+            if(!parameters.gfx11_workarounds || saw_buffer_swap ||
+               std::chrono::steady_clock::now() >= startup_poll_deadline)
+                sleep_fn();
+            else
+                sched_yield();
+        }
         do_sleep = true;  // Reset value
 
         // The status packet queries every SE and orders the initial start packet.
@@ -440,6 +463,7 @@ producer_loop(
 
             if(auto status = packet->query_buffer_status())
             {
+                saw_buffer_swap = true;
                 if(needs_copy) --free_slots;
                 if(status->gpu_full && parameters.restart_on_gpu_full)
                 {
@@ -531,6 +555,20 @@ producer_loop(
             std::fill(current_timestamps.begin(),
                       current_timestamps.end(),
                       rocprofiler_thread_trace_timestamp_t{});
+        }
+        else if(parameters.gfx11_workarounds && !saw_buffer_swap && !startup_retry_performed &&
+                std::chrono::steady_clock::now() >= startup_retry_deadline)
+        {
+            // A rare gfx11 start can complete without the SQTT block ever producing data.
+            // Reinitialize once while the producer is already active.
+            if(!stop_trace()) return;
+            iterate_trace();
+            send_header();
+            if(!parameters.restart_trace(parameters.control_packet)) return;
+
+            startup_retry_performed = true;
+            startup_poll_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
+            do_sleep              = false;
         }
     }
 
