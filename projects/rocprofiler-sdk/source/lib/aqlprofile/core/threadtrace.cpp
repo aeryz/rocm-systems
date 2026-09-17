@@ -127,9 +127,12 @@ _internal_aqlprofile_att_iterate_data(aqlprofile_handle_t            handle,
             ERR_LOGGING("SQTT memory error received, SE({})", se_index);
             if(status == HSA_STATUS_SUCCESS) status = HSA_STATUS_ERROR_OUT_OF_RESOURCES;
         }
-        auto status2_value = (pm4_factory->GetGpuId() >= aql_profile::GFX12_GPU_ID)
-                                 ? control_ptr[se_index].status2
-                                 : control_ptr[se_index].status;
+        const auto gpu_id = pm4_factory->GetGpuId();
+        auto       status2_value =
+            (gpu_id == aql_profile::GFX115X_GPU_ID || gpu_id >= aql_profile::GFX12_GPU_ID)
+                ? control_ptr[se_index].status2
+                : control_ptr[se_index].status;
+        const bool buffer_full = (status2_value & sqttbuilder->GetBufferFullMask()) != 0;
         // With multiple buffers, FULL means the hardware moved on to the next buffer and the
         // filled one still awaits a swap; data is only lost if that buffer overflowed too.
         uint64_t pending = 0;
@@ -141,8 +144,7 @@ _internal_aqlprofile_att_iterate_data(aqlprofile_handle_t            handle,
                                       control_ptr[se_index].cntr,
                                       control_ptr[se_index].wptr);
         const bool retired_pending = pending == 1;
-        if(memorymgr->isDoubleBuffer() ? pending > 1
-                                       : (status2_value & sqttbuilder->GetBufferFullMask()) != 0)
+        if(memorymgr->isDoubleBuffer() ? pending > 1 : buffer_full)
         {
             AQL_WARNING << "SQTT data buffer full, SE(" << se_index << ")";
             if(status == HSA_STATUS_SUCCESS) status = HSA_STATUS_ERROR_OUT_OF_RESOURCES;
@@ -150,20 +152,58 @@ _internal_aqlprofile_att_iterate_data(aqlprofile_handle_t            handle,
 
         uint64_t sample_capacity = memorymgr->config.GetCapacity(se_index);
         void*    sample_ptr = reinterpret_cast<void*>(memorymgr->config.GetSEBaseAddr(se_index));
+        const bool double_buffer = memorymgr->isDoubleBuffer();
+
+        if(double_buffer)
+        {
+            // The WPTR describes the buffer the hardware writes next: one slot on from the
+            // last completed swap, and one further on when a filled buffer still awaits its
+            // swap and is delivered below.
+            size_t buf_num = memorymgr->config.buffer_data.at(se_index).size();
+            auto   swap    = memorymgr->buffer_swaps.at(se_index) + (retired_pending ? 1 : 0);
+            sample_ptr     = memorymgr->config.buffer_data.at(se_index)[(swap + buf_num - 1) %
+                                                                   buf_num];
+        }
 
         // WPTR specifies the index in thread trace buffer where next token will be
         // written by hardware. The index is incremented by size of 32 bytes.
-        size_t wptr_mask = sqttbuilder->GetWritePtrMask();
-        size_t sample_size =
-            (control_ptr[se_index].wptr & wptr_mask) * sqttbuilder->GetWritePtrBlk();
+        size_t     wptr_mask   = sqttbuilder->GetWritePtrMask();
+        const auto raw_wptr    = control_ptr[se_index].wptr & wptr_mask;
+        size_t     sample_size = raw_wptr * sqttbuilder->GetWritePtrBlk();
 
-        if(pm4_factory->GetGpuId() == aql_profile::GFX11_GPU_ID)
+        AQL_CI_LOG(TRACE) << "ATT final snapshot: agent=" << memorymgr->GetAgent().handle
+                          << ", gpu_id=" << static_cast<int>(gpu_id) << ", se=" << se_index
+                          << ", status=" << std::showbase << std::hex
+                          << control_ptr[se_index].status
+                          << ", status2=" << control_ptr[se_index].status2
+                          << ", cntr=" << control_ptr[se_index].cntr
+                          << ", wptr=" << control_ptr[se_index].wptr << std::noshowbase
+                          << std::dec << ", base=" << sample_ptr
+                          << ", capacity=" << sample_capacity
+                          << ", double_buffer=" << double_buffer;
+
+        // In double-buffer mode, a zero final WPTR is either an empty partial
+        // buffer or an exactly full buffer. Use STATUS2 to distinguish them
+        // instead of treating zero as an address-relative wrap.
+        const bool zero_wptr_double_buffer = double_buffer && raw_wptr == 0;
+        if(zero_wptr_double_buffer) sample_size = buffer_full ? sample_capacity : 0;
+
+        // A gfx115x WPTR that already fits within capacity is a plain offset, so
+        // the address-relative correction below must not be applied to it.
+        const bool gfx115x_offset_wptr = gpu_id == aql_profile::GFX115X_GPU_ID &&
+                                         sample_size <= sample_capacity;
+        // Applies to the whole GFX11 family, including the gfx11.5x and gfx11.7x
+        // derived factories.  An exact-ID comparison would drop this fallback for
+        // gfx115x; the offset guard above keeps plain-offset gfx115x WPTRs out of
+        // the correction.  The legacy v1 path in aql_profile.cpp follows upstream
+        // and keeps the exact-ID check because it has no such guard.
+        if(!zero_wptr_double_buffer && !gfx115x_offset_wptr && pm4_factory->IsGFX11())
         {
             sample_size = sample_size - reinterpret_cast<uint64_t>(sample_ptr);
             sample_size &= (1ull << 29) - 1;
         }
 
-        if(sample_size >= sample_capacity)
+        if(sample_size > sample_capacity)
         {
             ERR_LOGGING("SQTT data out of bounds, sample_id({}) size({}/{})",
                         se_index,
@@ -176,11 +216,11 @@ _internal_aqlprofile_att_iterate_data(aqlprofile_handle_t            handle,
         sample_sizes.at(se_index) = sample_size;
         max_sample_size           = std::max(sample_size, max_sample_size);
 
-        if(memorymgr->isDoubleBuffer())
+        if(double_buffer)
         {
-            auto&  buffer_swap = memorymgr->buffer_swaps.at(se_index);
-            auto&  buffer_data = memorymgr->config.buffer_data.at(se_index);
-            size_t buf_num     = buffer_data.size();
+            auto& buffer_swap = memorymgr->buffer_swaps.at(se_index);
+            auto& buffer_data = memorymgr->config.buffer_data.at(se_index);
+            size_t buf_num    = buffer_data.size();
             if(retired_pending)
             {
                 // Deliver the filled buffer as a status query + swap would have. Like the
@@ -192,7 +232,7 @@ _internal_aqlprofile_att_iterate_data(aqlprofile_handle_t            handle,
                 if(callback_status != HSA_STATUS_SUCCESS) return callback_status;
                 ++buffer_swap;
             }
-            sample_ptr           = buffer_data[(buffer_swap + buf_num - 1) % buf_num];
+            sample_ptr = buffer_data[(buffer_swap + buf_num - 1) % buf_num];
             auto callback_status = callback(se_index, sample_ptr, sample_size, userdata);
             if(callback_status != HSA_STATUS_SUCCESS) return callback_status;
         }
@@ -412,6 +452,21 @@ _internal_aqlprofile_att_create_packets(aqlprofile_handle_t*                  ha
 
     // Generate start commands
     sqtt_builder->Begin(&start_cmd, &trace_config);
+    // Seed the control-buffer WPTR with the same address-relative block index the
+    // SQTT builder programs, so the final snapshot is meaningful even when the
+    // hardware does not update that field. Applies to the whole GFX11 family.
+    if(pm4_factory->IsGFX11())
+    {
+        auto* control_ptr = memorymgr->GetTraceControlBuf<pm4_builder::TraceControl>();
+        for(size_t se_index = 0; se_index < se_number_total; ++se_index)
+        {
+            if(trace_config.GetTargetCU(se_index) < 0) continue;
+            control_ptr[se_index].wptr =
+                (reinterpret_cast<uint64_t>(trace_config.GetSEBaseAddr(se_index)) /
+                 sqtt_builder->GetWritePtrBlk()) &
+                sqtt_builder->GetWritePtrMask();
+        }
+    }
     // Generate stop commands
     sqtt_builder->End(&stop_cmd, &trace_config);
 
@@ -533,6 +588,27 @@ aqlprofile_att_update_buffer_status(aqlprofile_att_buffer_status_t* out,
 
     auto it = manager->config.buffer_data.find(shader_engine_id);
     if(it == manager->config.buffer_data.end()) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+
+    if(pm4_builder::sqtt_debug_enabled())
+    {
+        ROCP_INFO << fmt::format(
+            "SQTT debug se={} status=0x{:08x} status2=0x{:08x} ctrl=0x{:08x} wptr=0x{:08x} "
+            "buf0_size=0x{:08x} buf0_base=0x{:08x} buf1_size=0x{:08x} buf1_base=0x{:08x} "
+            "needs_swap={} too_late={} capacity={} swaps={}",
+            shader_engine_id,
+            control.status_plain,
+            status,
+            control.ctrl,
+            control.wptr_mid,
+            control.buf0_size,
+            control.buf0_base,
+            control.buf1_size,
+            control.buf1_base,
+            out->needs_swap,
+            out->is_too_late,
+            manager->config.capacity_per_se,
+            manager->buffer_swaps.at(shader_engine_id));
+    }
 
     if(out->needs_swap)
     {

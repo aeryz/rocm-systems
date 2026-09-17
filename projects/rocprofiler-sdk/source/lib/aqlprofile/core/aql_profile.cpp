@@ -854,6 +854,7 @@ hsa_ven_amd_aqlprofile_iterate_data(const hsa_ven_amd_aqlprofile_profile_t* prof
                 auto& trace_config = aql_profile::configs.at(profile->command_buffer.ptr);
                 pm4_builder::SqttBuilder* sqttbuilder     = pm4_factory->GetSqttBuilder();
                 const uint64_t            se_number_total = pm4_factory->GetShaderEnginesNumber();
+                const auto                gpu_id          = pm4_factory->GetGpuId();
                 // Control buffer was allocated as the CmdBuffer prefix partition
                 aql_profile::CommandBufferMgr cmd_buffer_mgr(profile);
 
@@ -862,12 +863,17 @@ hsa_ven_amd_aqlprofile_iterate_data(const hsa_ven_amd_aqlprofile_profile_t* prof
                 // Check if SQTT buffer was wrapped
                 for(size_t se_index = 0; se_index < se_number_total; se_index++)
                 {
+                    const auto full_status =
+                        (gpu_id == aql_profile::GFX115X_GPU_ID ||
+                         gpu_id >= aql_profile::GFX12_GPU_ID)
+                            ? control_ptr[se_index].status2
+                            : control_ptr[se_index].status;
                     if(control_ptr[se_index].status & sqttbuilder->GetUTCErrorMask())
                     {
                         ERR_LOGGING("SQTT memory error received, SE({})", se_index);
                         status = HSA_STATUS_ERROR_EXCEPTION;
                     }
-                    else if(control_ptr[se_index].status & sqttbuilder->GetBufferFullMask())
+                    else if(full_status & sqttbuilder->GetBufferFullMask())
                     {
                         AQL_WARNING << "SQTT data buffer full, SE(" << se_index << ")";
                         if(status == HSA_STATUS_SUCCESS) status = HSA_STATUS_ERROR_OUT_OF_RESOURCES;
