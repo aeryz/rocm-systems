@@ -191,6 +191,11 @@ ThreadTraceAQLPacketFactory::ThreadTraceAQLPacketFactory(
                                   AQLPROFILE_ATT_PARAMETER_NAME_EXEC_MASK_TRACE),
                               {1}});
 
+    if(params.all_vmids)
+        aql_params.push_back({static_cast<hsa_ven_amd_aqlprofile_parameter_name_t>(
+                                  AQLPROFILE_ATT_PARAMETER_NAME_ALL_VMIDS),
+                              {1}});
+
     if(perf_ctrl != 0 && !params.perfcounters.empty())
     {
         for(const auto& perf_counter : params.perfcounters)

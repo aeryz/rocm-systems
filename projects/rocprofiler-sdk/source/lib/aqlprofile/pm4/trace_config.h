@@ -80,6 +80,7 @@ struct TraceConfig
 
     bool enable_rt_timestamp{false};
     bool texec{false};  // Enable trace exec mask
+    bool trace_all_vmids{false};
 
     int      GetTargetCU(int SE) const { return target_cu_per_se.at(SE); };
     uint64_t GetSEmask() const { return se_mask; };
