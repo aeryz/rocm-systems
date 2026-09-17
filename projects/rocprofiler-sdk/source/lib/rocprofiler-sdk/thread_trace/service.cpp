@@ -214,6 +214,10 @@ rocprofiler_configure_device_thread_trace_service(
     // Serialization not supported in device mode
     if(pack.bSerialize) return ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT;
 
+    // Device ATT is programmed from an internal control queue. Capture waves
+    // from application queues even when the runtime assigns another VMID.
+    pack.all_vmids = true;
+
     if(pack.num_buffers > 1)
     {
         // Multi-buffer mode requires specific AQLProfile symbols that may not be available
