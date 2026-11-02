@@ -37,6 +37,7 @@ namespace Callbacks
 {
 rocprofiler_thread_trace_decoder_id_t decoder{};
 std::atomic<size_t>                   latency{0};
+std::atomic<bool>                     skip_missing_detailed_profiling{false};
 std::atomic<bool>                     has_sdata{false};
 std::atomic<bool>                     has_excess_detail{false};
 ExecMaskCheck                         exec_mask_check{};
@@ -132,7 +133,14 @@ finalize(void* /* tool_data */)
         if(extra_args && latency != 0 && has_excess_detail)
             throw std::runtime_error("Got detailed profiling in nondetail mode");
         else if(!extra_args && latency == 0)
-            throw std::runtime_error("Missing detailed profiling!");
+        {
+            if(skip_missing_detailed_profiling)
+                std::cout << "SKIP: a single-buffer device trace start issued before hsa_init() "
+                             "does not produce detailed profiling on gfx11.5x"
+                          << std::endl;
+            else
+                throw std::runtime_error("Missing detailed profiling!");
+        }
 
         // disabling until new decoder version is picked up
         // if(!has_sdata) throw std::runtime_error("Missing shaderdata record!");

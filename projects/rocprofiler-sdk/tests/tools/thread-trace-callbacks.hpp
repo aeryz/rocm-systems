@@ -54,6 +54,11 @@
 
 namespace Callbacks
 {
+// gfx11.5x drops a single-buffer device trace start issued before hsa_init(), so the
+// deferred-start fixture cannot observe detailed profiling there. The agent tool sets this
+// flag so finalize() reports the documented skip instead of failing the latency check.
+extern std::atomic<bool> skip_missing_detailed_profiling;
+
 void
 tool_codeobj_tracing_callback(rocprofiler_callback_tracing_record_t record,
                               rocprofiler_user_data_t*,

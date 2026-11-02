@@ -44,12 +44,15 @@ rocprofiler_add_integration_execute_test(
     ENVIRONMENT "ROCPROFILER_SQTT_FORCE_HSA=1")
 
 # Start before hsa_init(): verifies the request is cached and replayed once HSA registers.
+# gfx11.5x drops the early single-buffer programming, so the tool reports a skip there
+# instead of failing the detailed-profiling check.
 rocprofiler_add_integration_execute_test(
     thread-trace-api-agent-before-hsa-init-test
     TARGET thread-trace-test-app
     TIMEOUT 10
     LABELS "integration-tests"
     PRELOAD "$<TARGET_FILE:thread-trace-agent-tool>"
+    SKIP_REGULAR_EXPRESSION "SKIP: a single-buffer device trace start issued before hsa_init"
     ENVIRONMENT "ATT_START_BEFORE_HSA_INIT=1")
 
 # Start+stop before hsa_init(): verifies the cached request is dropped and not replayed.

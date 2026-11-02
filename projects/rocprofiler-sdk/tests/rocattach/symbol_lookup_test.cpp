@@ -75,6 +75,33 @@ cleanup_loaded_library(loaded_library& library)
     }
 }
 
+// The resolver prefers /proc/<pid>/map_files, and the kernel refuses to open those entries
+// without CAP_SYS_ADMIN in some containers. The resolver then falls back to the target-root
+// pathname, where identity is established by the GNU Build ID, so the fixture linked with
+// "--build-id=none" is rejected by design and the test cannot pass. Report a skip instead.
+bool
+map_files_openable()
+{
+    auto maps = std::ifstream{"/proc/self/maps"};
+    auto line = std::string{};
+    while(std::getline(maps, line))
+    {
+        auto range_end = line.find(' ');
+        auto path_pos  = line.find('/');
+        if(range_end == std::string::npos || path_pos == std::string::npos) continue;
+
+        auto entry = "/proc/self/map_files/" + line.substr(0, range_end);
+        auto fd    = ::open(entry.c_str(), O_RDONLY | O_CLOEXEC);
+        if(fd >= 0)
+        {
+            ::close(fd);
+            return true;
+        }
+        if(errno == EPERM || errno == EACCES) return false;
+    }
+    return false;
+}
+
 loaded_library
 load_library(const char* path)
 {
@@ -609,6 +636,15 @@ expect_load_bias_handles_mapping_layouts()
 int
 main(int argc, char** argv)
 {
+    if(!map_files_openable())
+    {
+        std::cout << "SKIP: cannot open /proc/<pid>/map_files entries (requires CAP_SYS_ADMIN); "
+                     "the resolver would fall back to GNU Build ID validation, which rejects the "
+                     "fixture linked without a Build ID"
+                  << std::endl;
+        return 0;
+    }
+
     if(argc != 8)
     {
         std::cerr << "Usage: " << argv[0]

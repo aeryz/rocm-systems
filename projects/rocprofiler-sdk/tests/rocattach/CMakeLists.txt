@@ -149,6 +149,8 @@ if(TARGET rocprofiler-sdk::rocprofiler-sdk-build-flags
         ENVIRONMENT "${rocattach-test-env}"
         PASS_REGULAR_EXPRESSION
             "Test PASSED: target ELF resolver resolved exact mapped libraries and rejected ambiguous and malformed mappings"
+        SKIP_REGULAR_EXPRESSION
+            "SKIP: cannot open /proc/<pid>/map_files entries"
         FAIL_REGULAR_EXPRESSION "${ROCPROFILER_DEFAULT_FAIL_REGEX}")
 else()
     message(
