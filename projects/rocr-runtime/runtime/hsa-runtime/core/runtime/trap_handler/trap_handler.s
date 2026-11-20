@@ -387,293 +387,189 @@ trap_entry:
 
 .if .amdgcn.gfx_generation_number == 11
 .profile_trap_handlers_gfx11:
-  // GFX11 host-trap PC sampling handler.
-  // Writes a 64-byte sample record to the double-buffer in device_data,
-  // ported from the GFX12 handler (trap_handler_gfx12.s).
+  // GFX11 PC sampling handler (host trap and stochastic). Writes one 64-byte
+  // record into the double buffer at device_data, following the GFX12 handler
+  // (trap_handler_gfx12.s).
   //
-  // Register state at entry (set by CWSR first-level handler):
-  //   ttmp0:1   = saved PC (hardware)
-  //   ttmp6     = DispatchPktIndx[24:0] (SPI-initialized, preserved for correlation)
-  //   ttmp12    = saved STATUS (hardware)
-  //   ttmp14:15 = secondary TMA VA (our TMA, loaded by CWSR from CWSR_TMA[1])
+  // Only the ttmps the gfx11 ABI leaves to the second-level handler are used:
+  // ttmp2..5, ttmp7, ttmp13, ttmp14..15. ttmp6 and ttmp8..11 hold the dispatch
+  // index, workgroup ID and wave ID that SPI writes once at wave launch; a
+  // later trap of the same wave, and the debugger, must still find them.
   //
-  // ISA differences from GFX12:
-  //   global_store_b64 → global_store_dwordx2, scope:SCOPE_SYS → glc
-  //   global_atomic_add_u64 → global_atomic_add_x2
-  //   s_wait_storecnt → s_waitcnt_vscnt null, s_wait_loadcnt → s_waitcnt vmcnt
-  //   s_load_b64 → s_load_dwordx2, s_load_b32 → s_load_dword
+  //   ttmp2, ttmp3, ttmp7 : lane 0 of v0, v1, v2
+  //   ttmp[4:5]           : exec
+  //   ttmp13              : bit 21 stochastic, bit 22 host trap, bit 31 buffer id
+  //   ttmp[14:15]         : device_data VA on entry (set by the dispatcher);
+  //                         scratch once the slot address is known, then
+  //                         reloaded from the TMAs for the watermark phase
 
-  // --- Phase 1: Load device_data VA from TMA[0] ---
-  // We already loaded the secondary TMA VA or stochastic VA into ttmp[14:15] in the dispatcher.
-  // So NO need to s_load_dwordx2 ttmp[14:15], ttmp[14:15], 0x0
-  // ttmp[14:15] = device_data VA (hosttrap buffer base or stochastic buffer base)
-
-  // --- Phase 2: Save exec and v0:v1 ---
-  s_mov_b64                             ttmp[10:11], exec
+  // --- Save exec and lane 0 of v0..v2 ---
+  s_mov_b64                             ttmp[4:5], exec
   s_mov_b64                             exec, 1
   v_readlane_b32                        ttmp2, v0, 0
   v_readlane_b32                        ttmp3, v1, 0
+  v_readlane_b32                        ttmp7, v2, 0
 
-  // --- Phase 3: Atomic increment buf_write_val to claim a slot ---
+  // --- Claim a slot: v[0:1] = old buf_write_val (lo = index, hi bit 31 = buffer id) ---
   v_mov_b32                             v0, 1
   v_mov_b32                             v1, 0
   global_atomic_add_x2                  v[0:1], v1, v[0:1], ttmp[14:15] glc
   s_waitcnt                             vmcnt(0)
-  // v[0:1] = old buf_write_val (lo=sample_index, hi bit63=buffer_id)
 
-  // --- Phase 4: Extract buffer_id, bounds check ---
-  v_readlane_b32                        ttmp4, v1, 0
-  // Preserve the trap-type bits in ttmp13; stash buffer_id in ttmp6[31]
-  // since correlation only consumes ttmp6[24:0].
-  s_bitset0_b32                         ttmp6, 31
-  s_bitcmp1_b32                         ttmp4, 31
-  s_cbranch_scc0                        .gfx11_buffer_id_ready
-  s_bitset1_b32                         ttmp6, 31
+  // --- Drop the sample if index >= 2^32 or index >= buf_size ---
+  v_lshrrev_b32                         v2, 31, v1
+  v_and_b32                             v1, 0x7FFFFFFF, v1
+  v_cmpx_eq_u32                         0, v1
+  s_cbranch_execz                       .gfx11_restore
+  global_load_dword                     v1, v1, ttmp[14:15] offset:0x08   // buf_size; v1 == 0 is the offset
+  s_waitcnt                             vmcnt(0)
+  v_cmpx_gt_u32                         v1, v0
+  s_cbranch_execz                       .gfx11_restore
+
+  // --- Remember the buffer id in ttmp13[31] ---
+  s_bitset0_b32                         ttmp13, 31
+  v_cmpx_ne_u32                         0, v2
+  s_cbranch_execz                       .gfx11_buffer_id_ready
+  s_bitset1_b32                         ttmp13, 31
 .gfx11_buffer_id_ready:
-  v_and_b32                             v1, v1, 0x7FFFFFFF
-
-  // Overflow: if hi 31 bits nonzero, index > 2^32
-  v_readlane_b32                        ttmp5, v1, 0
-  s_cmp_lg_u32                          ttmp5, 0
-  s_cbranch_scc1                        .gfx11_lost_sample
-
-  // Load buf_size, compare against sample_index
-  s_load_dword                          ttmp5, ttmp[14:15], 0x08
-  v_readlane_b32                        ttmp4, v0, 0
-  // ttmp4 = sample_index
-  s_waitcnt                             lgkmcnt(0)
-  s_cmp_ge_u32                          ttmp4, ttmp5
-  s_cbranch_scc1                        .gfx11_lost_sample
-
-  // --- Phase 5: Compute slot address ---
-  // Stash v0/v1 backup (ttmp2:3) into exec to free ttmp2:3
-  s_mov_b64                             exec, ttmp[2:3]
-
-  // buffer_base = device_data + 0x40 + buffer_id * buf_size * 64
-  s_lshr_b32                            ttmp7, ttmp6, 31
-  s_mul_i32                             ttmp2, ttmp5, ttmp7
-  s_mul_hi_u32                          ttmp3, ttmp5, ttmp7
-  s_lshl_b64                            ttmp[2:3], ttmp[2:3], 6
-  s_add_u32                             ttmp2, ttmp2, 0x40
-  s_addc_u32                            ttmp3, ttmp3, 0
-  s_add_u32                             ttmp7, ttmp14, ttmp2
-  s_addc_u32                            ttmp8, ttmp15, ttmp3
-  // ttmp[7:8] = buffer base address
-
-  // slot_addr = buffer_base + sample_index * 64
-  s_mul_i32                             ttmp9, ttmp4, 64
-  s_mul_hi_u32                          ttmp4, ttmp4, 64
-  s_add_u32                             ttmp2, ttmp7, ttmp9
-  s_addc_u32                            ttmp3, ttmp8, ttmp4
-  // ttmp[2:3] = &buffer[entry]
-
-  // Save v2/v3 backup
-  v_readlane_b32                        ttmp4, v2, 0
-  v_readlane_b32                        ttmp5, v3, 0
-
-  // Put slot address in v[0:1]
-  v_writelane_b32                       v0, ttmp2, 0
-  v_writelane_b32                       v1, ttmp3, 0
-  // v[0:1] = &buffer[entry]
-
-  // Save v0/v1 backup from exec → ttmp[2:3], restore exec=1
-  s_mov_b64                             ttmp[2:3], exec
   s_mov_b64                             exec, 1
 
-  // --- Phase 6: Fill 64-byte sample record ---
+  // --- v[0:1] = device_data + 0x40 + (buffer_id * buf_size + index) * 64 ---
+  v_mul_lo_u32                          v2, v2, v1
+  v_add3_u32                            v2, v2, v0, 1                     // +1 record = the 0x40 header
+  v_mad_u64_u32                         v[0:1], null, v2, 64, ttmp[14:15]
+
   s_bitcmp1_b32                         ttmp13, TTMP13_PCS_IS_STOCHASTIC
-  s_cbranch_scc1                        .fill_sample_stochastic_gfx11
+  s_cbranch_scc1                        .gfx11_fill_stochastic
 
-  // 6a: PC (offset 0x00, 8 bytes) — from ttmp0/ttmp1
-  v_writelane_b32                       v2, ttmp0, 0
-  v_and_b32                             v2, v2, 0xFFFFFFFC
-  v_writelane_b32                       v3, ttmp1, 0
-  v_and_b32                             v3, v3, 0x0000FFFF
-  global_store_dwordx2                  v[0:1], v[2:3], off offset:0x00 glc
-
-  // 6b: exec_mask (offset 0x08, 8 bytes) — from saved exec
-  v_writelane_b32                       v2, ttmp10, 0
-  v_writelane_b32                       v3, ttmp11, 0
-  global_store_dwordx2                  v[0:1], v[2:3], off offset:0x08 glc
-
-  // 6c: workgroup_id + chiplet (offset 0x10-0x1F, 16 bytes) — zero on GFX11
-  //     (SPI does not initialize ttmp7/8/9 with workgroup IDs on GFX11)
+  // --- Host trap: 0x00 PC, 0x24..0x2f reserved ---
+  v_mov_b32                             v2, ttmp0
+  v_and_b32                             v2, 0xFFFFFFFC, v2
+  global_store_dword                    v[0:1], v2, off offset:0x00 glc
+  s_and_b32                             ttmp14, ttmp1, SQ_WAVE_PC_HI_ADDRESS_MASK
+  v_mov_b32                             v2, ttmp14
+  global_store_dword                    v[0:1], v2, off offset:0x04 glc
   v_mov_b32                             v2, 0
-  v_mov_b32                             v3, 0
-  global_store_dwordx2                  v[0:1], v[2:3], off offset:0x10 glc
-  global_store_dwordx2                  v[0:1], v[2:3], off offset:0x18 glc
-
-  // 6d: hw_id (offset 0x20, 4 bytes) — raw HW_REG_HW_ID1.
-  // Do not use raw hwreg(24): on gfx11.x it disassembles as HW_REG_HW_ID2,
-  // while the gfx1151 parser decodes HW_ID1 fields.
-  s_getreg_b32                          ttmp7, hwreg(HW_REG_HW_ID1)
-  v_writelane_b32                       v2, ttmp7, 0
-  global_store_dword                    v[0:1], v2, off offset:0x20 glc
-
-  // 6e: reserved (offset 0x24-0x2F, 12 bytes) — zero
-  v_mov_b32                             v2, 0
-  v_mov_b32                             v3, 0
   global_store_dword                    v[0:1], v2, off offset:0x24 glc
-  global_store_dwordx2                  v[0:1], v[2:3], off offset:0x28 glc
+  global_store_dword                    v[0:1], v2, off offset:0x28 glc
+  global_store_dword                    v[0:1], v2, off offset:0x2c glc
+  s_branch                              .gfx11_fill_common
 
-  // 6f: timestamp (offset 0x30, 8 bytes) — GPU realtime
-  s_sendmsg_rtn_b64                     ttmp[8:9], sendmsg(MSG_RTN_GET_REALTIME)
-  s_waitcnt                             lgkmcnt(0)
-  v_writelane_b32                       v2, ttmp8, 0
-  v_writelane_b32                       v3, ttmp9, 0
-  global_store_dwordx2                  v[0:1], v[2:3], off offset:0x30 glc
-
-  // 6g: correlation_id (offset 0x38, 8 bytes)
-  //     lo = dispatch_pkt_idx[24:0] from ttmp6 (SPI-initialized)
-  //     hi = doorbell_id[9:0] from MSG_RTN_GET_DOORBELL
-  s_sendmsg_rtn_b32                     ttmp7, sendmsg(MSG_RTN_GET_DOORBELL)
-  s_waitcnt                             lgkmcnt(0)
-  s_and_b32                             ttmp7, ttmp7, 0x3FF
-  v_writelane_b32                       v3, ttmp7, 0
-  s_and_b32                             ttmp7, ttmp6, 0x1FFFFFF
-  v_writelane_b32                       v2, ttmp7, 0
-  global_store_dwordx2                  v[0:1], v[2:3], off offset:0x38 glc
-
-  s_branch                              .gfx11_fill_sample_done
-
-.fill_sample_stochastic_gfx11:
-  // Capture perf snapshot metadata before PC_HI, which appears to release the snapshot lock.
-  s_getreg_b32                          ttmp8, hwreg(27) // HW_REG_PERF_SNAPSHOT_DATA
-
-  // 6a: PC (offset 0x00, 8 bytes) — from HW_REG_SQ_PERF_SNAPSHOT_PC_LO/HI
-  // Keep ttmp4:5 intact so Phase 9 can restore v2:v3 correctly.
-  s_getreg_b32                          ttmp7, hwreg(18) // HW_REG_SQ_PERF_SNAPSHOT_PC_LO
-  s_getreg_b32                          ttmp9, hwreg(19) // HW_REG_SQ_PERF_SNAPSHOT_PC_HI
-  v_writelane_b32                       v2, ttmp7, 0
-  v_writelane_b32                       v3, ttmp9, 0
-  global_store_dwordx2                  v[0:1], v[2:3], off offset:0x00 glc
-
-  // 6b: exec_mask (offset 0x08, 8 bytes) — from saved exec
-  v_writelane_b32                       v2, ttmp10, 0
-  v_writelane_b32                       v3, ttmp11, 0
-  global_store_dwordx2                  v[0:1], v[2:3], off offset:0x08 glc
-
-  // 6c: wg_id (offset 0x10, 16 bytes) - zero
+.gfx11_fill_stochastic:
+  // --- Stochastic: 0x00 PC and 0x24 snapshot from the perf snapshot registers ---
+  // PERF_SNAPSHOT_DATA must be read before PC_HI, which releases the snapshot.
+  // gfx11.5 has no PERF_SNAPSHOT_DATA1/2, so 0x28/0x2c stay zero.
+  s_getreg_b32                          ttmp15, hwreg(27)                 // HW_REG_PERF_SNAPSHOT_DATA
+  s_getreg_b32                          ttmp14, hwreg(18)                 // HW_REG_SQ_PERF_SNAPSHOT_PC_LO
+  v_mov_b32                             v2, ttmp14
+  global_store_dword                    v[0:1], v2, off offset:0x00 glc
+  s_getreg_b32                          ttmp14, hwreg(19)                 // HW_REG_SQ_PERF_SNAPSHOT_PC_HI
+  v_mov_b32                             v2, ttmp14
+  global_store_dword                    v[0:1], v2, off offset:0x04 glc
+  v_mov_b32                             v2, ttmp15
+  global_store_dword                    v[0:1], v2, off offset:0x24 glc
   v_mov_b32                             v2, 0
-  v_mov_b32                             v3, 0
-  global_store_dwordx2                  v[0:1], v[2:3], off offset:0x10 glc
-  global_store_dwordx2                  v[0:1], v[2:3], off offset:0x18 glc
+  global_store_dword                    v[0:1], v2, off offset:0x28 glc
+  global_store_dword                    v[0:1], v2, off offset:0x2c glc
 
-  // 6d: hw_id (offset 0x20, 4 bytes) — raw HW_REG_HW_ID1.
-  // Do not use raw hwreg(24): on gfx11.x it disassembles as HW_REG_HW_ID2,
-  // while the gfx1151 parser decodes HW_ID1 fields.
-  s_getreg_b32                          ttmp7, hwreg(HW_REG_HW_ID1)
-  v_writelane_b32                       v2, ttmp7, 0
-
-  // 6e: snapshot data (offset 0x24, 12 bytes)
-  v_writelane_b32                       v3, ttmp8, 0
-  global_store_dwordx2                  v[0:1], v[2:3], off offset:0x20 glc
-
-  v_mov_b32                             v2, 0 // data1
-  v_mov_b32                             v3, 0 // data2
-  global_store_dwordx2                  v[0:1], v[2:3], off offset:0x28 glc
-
-  // 6f: timestamp (offset 0x30, 8 bytes) — GPU realtime
-  s_sendmsg_rtn_b64                     ttmp[8:9], sendmsg(MSG_RTN_GET_REALTIME)
+.gfx11_fill_common:
+  // 0x08 exec
+  v_mov_b32                             v2, ttmp4
+  global_store_dword                    v[0:1], v2, off offset:0x08 glc
+  v_mov_b32                             v2, ttmp5
+  global_store_dword                    v[0:1], v2, off offset:0x0c glc
+  // 0x10 workgroup ID X/Y/Z (ttmp8..10, written by SPI when TTMP setup is on)
+  v_mov_b32                             v2, ttmp8
+  global_store_dword                    v[0:1], v2, off offset:0x10 glc
+  v_mov_b32                             v2, ttmp9
+  global_store_dword                    v[0:1], v2, off offset:0x14 glc
+  v_mov_b32                             v2, ttmp10
+  global_store_dword                    v[0:1], v2, off offset:0x18 glc
+  // 0x1c wave in workgroup (ttmp11[5:0]); the chiplet field stays 0
+  s_and_b32                             ttmp14, ttmp11, 0x3F
+  v_mov_b32                             v2, ttmp14
+  global_store_dword                    v[0:1], v2, off offset:0x1c glc
+  // 0x20 HW_ID1, the layout the gfx115x parser decodes. Raw hwreg(24) would be
+  // HW_ID2 on gfx11.
+  s_getreg_b32                          ttmp14, hwreg(HW_REG_HW_ID1)
+  v_mov_b32                             v2, ttmp14
+  global_store_dword                    v[0:1], v2, off offset:0x20 glc
+  // 0x30 timestamp
+  s_sendmsg_rtn_b64                     ttmp[14:15], sendmsg(MSG_RTN_GET_REALTIME)
   s_waitcnt                             lgkmcnt(0)
-  v_writelane_b32                       v2, ttmp8, 0
-  v_writelane_b32                       v3, ttmp9, 0
-  global_store_dwordx2                  v[0:1], v[2:3], off offset:0x30 glc
-
-  // 6g: correlation_id (offset 0x38, 8 bytes)
-  s_sendmsg_rtn_b32                     ttmp7, sendmsg(MSG_RTN_GET_DOORBELL)
+  v_mov_b32                             v2, ttmp14
+  global_store_dword                    v[0:1], v2, off offset:0x30 glc
+  v_mov_b32                             v2, ttmp15
+  global_store_dword                    v[0:1], v2, off offset:0x34 glc
+  // 0x38 correlation id: lo = dispatch packet index (ttmp6[24:0]), hi = doorbell id
+  s_and_b32                             ttmp14, ttmp6, 0x1FFFFFF
+  v_mov_b32                             v2, ttmp14
+  global_store_dword                    v[0:1], v2, off offset:0x38 glc
+  s_sendmsg_rtn_b32                     ttmp14, sendmsg(MSG_RTN_GET_DOORBELL)
   s_waitcnt                             lgkmcnt(0)
-  s_and_b32                             ttmp7, ttmp7, 0x3FF
-  v_writelane_b32                       v3, ttmp7, 0
-  s_and_b32                             ttmp7, ttmp6, 0x1FFFFFF
-  v_writelane_b32                       v2, ttmp7, 0
-  global_store_dwordx2                  v[0:1], v[2:3], off offset:0x38 glc
-
-.gfx11_fill_sample_done:
-  // Wait for all sample stores to complete before watermark check
+  s_and_b32                             ttmp14, ttmp14, DOORBELL_ID_MASK
+  v_mov_b32                             v2, ttmp14
+  global_store_dword                    v[0:1], v2, off offset:0x3c glc
   s_waitcnt_vscnt                       null, 0
 
-  // --- Phase 7: Increment buf_written_valX, check watermark ---
-  // buf_written_valX at device_data + 0x10 + buffer_id * 0x10
-  s_lshr_b32                            ttmp7, ttmp6, 31
-  s_mul_i32                             ttmp7, ttmp7, 0x10
-  s_add_u32                             ttmp8, ttmp14, ttmp7
-  s_addc_u32                            ttmp9, ttmp15, 0
-  s_add_u32                             ttmp8, ttmp8, 0x10
-  s_addc_u32                            ttmp9, ttmp9, 0
-  // ttmp[8:9] = &buf_written_valX
+  // --- Reload device_data: CWSR TMA[1] = second-level TMA, then TMA2[0] or TMA2[8] ---
+  s_sendmsg_rtn_b64                     ttmp[14:15], sendmsg(MSG_RTN_GET_TMA)
+  s_waitcnt                             lgkmcnt(0)
+  s_lshl_b64                            ttmp[14:15], ttmp[14:15], 8
+  s_bfe_i64                             ttmp[14:15], ttmp[14:15], (48 << 16)  // sign-extend the 48-bit VA
+  s_load_dwordx2                        ttmp[14:15], ttmp[14:15], 0x8
+  s_waitcnt                             lgkmcnt(0)
+  s_bitcmp1_b32                         ttmp13, TTMP13_PCS_IS_STOCHASTIC
+  s_cbranch_scc1                        .gfx11_reload_stochastic
+  s_load_dwordx2                        ttmp[14:15], ttmp[14:15], 0x0
+  s_branch                              .gfx11_reloaded
+.gfx11_reload_stochastic:
+  s_load_dwordx2                        ttmp[14:15], ttmp[14:15], 0x8
+.gfx11_reloaded:
+  s_waitcnt                             lgkmcnt(0)
 
-  v_mov_b32                             v0, 0
+  // --- buf_written_valX += 1 at device_data + 0x10 + buffer_id * 0x10; watermark at +4 ---
+  v_mov_b32                             v2, 0x10
+  s_bitcmp1_b32                         ttmp13, 31
+  s_cbranch_scc0                        .gfx11_written_offset_ready
+  v_mov_b32                             v2, 0x20
+.gfx11_written_offset_ready:
   v_mov_b32                             v1, 1
-  global_atomic_add                     v0, v0, v1, ttmp[8:9] glc
+  global_atomic_add                     v1, v2, v1, ttmp[14:15] glc
+  global_load_dword                     v0, v2, ttmp[14:15] offset:0x04
   s_waitcnt                             vmcnt(0)
-  // v0 = old buf_written_valX
+  v_add_nc_u32                          v1, 1, v1
+  v_cmpx_lt_u32                         v1, v0
+  s_cbranch_execnz                      .gfx11_restore                    // watermark not reached
+  s_mov_b64                             exec, 1
 
-  // Load watermark (at buf_written_valX + 4)
-  // NOTE: ttmp6 holds DispatchPktIndx[24:0] and is only initialized when the
-  // wave is launched, so it must not be used as scratch here: overwriting it
-  // would make every later trap of this wave report a bogus correlation_id.
-  // ttmp13 is free once the fill path has been selected.
-  s_load_dword                          ttmp7, ttmp[8:9], 0x04
-  v_readlane_b32                        ttmp13, v0, 0
-  s_waitcnt                             lgkmcnt(0)
-  s_add_u32                             ttmp13, ttmp13, 1
-  s_cmp_lt_u32                          ttmp13, ttmp7
-  s_cbranch_scc1                        .gfx11_restore_exit
-
-  // --- Phase 8: Signal host (watermark reached) ---
-  // Load done_sig handle (at buf_written_valX + 8)
-  s_load_dwordx2                        ttmp[8:9], ttmp[8:9], 0x08
-  s_waitcnt                             lgkmcnt(0)
-  // ttmp[8:9] = done_sig pointer (hsa_signal_t handle → amd_signal_t)
-
-  // Zero out signal value (at done_sig + 0x08)
-  v_mov_b32                             v0, 0
-  v_mov_b32                             v1, 0
-  v_writelane_b32                       v2, ttmp8, 0
-  v_writelane_b32                       v3, ttmp9, 0
-  global_store_dwordx2                  v[2:3], v[0:1], off offset:0x08 glc
-
-  // Load event_id (done_sig + 0x18) and mailbox_ptr (done_sig + 0x10)
-  s_load_dword                          ttmp13, ttmp[8:9], 0x18
-  s_load_dwordx2                        ttmp[8:9], ttmp[8:9], 0x10
-  s_waitcnt                             lgkmcnt(0)
-
-  // Skip if null mailbox or zero event_id
-  s_or_b32                              ttmp7, ttmp8, ttmp9
-  s_cbranch_scc0                        .gfx11_restore_exit
-  s_cmp_eq_u32                          ttmp13, 0
-  s_cbranch_scc1                        .gfx11_restore_exit
-
-  // Write event_id to mailbox, send MSG_INTERRUPT
-  v_writelane_b32                       v2, ttmp8, 0
-  v_writelane_b32                       v3, ttmp9, 0
+  // --- Watermark reached: zero done_sig (at +8) and raise its event ---
+  global_load_dwordx2                   v[0:1], v2, ttmp[14:15] offset:0x08
+  s_waitcnt                             vmcnt(0)
+  v_mov_b32                             v2, 0
+  global_store_dword                    v[0:1], v2, off offset:0x08 glc   // amd_signal_t value
+  global_store_dword                    v[0:1], v2, off offset:0x0c glc
   s_waitcnt_vscnt                       null, 0
-  v_writelane_b32                       v0, ttmp13, 0
-  global_store_dword                    v[2:3], v0, off offset:0x00 glc
+  global_load_dword                     v2, v[0:1], off offset:0x18       // event_id
+  global_load_dwordx2                   v[0:1], v[0:1], off offset:0x10   // event mailbox
+  s_waitcnt                             vmcnt(0)
+  v_cmpx_ne_u32                         0, v2
+  v_cmpx_ne_u64                         0, v[0:1]
+  s_cbranch_execz                       .gfx11_restore
+  global_store_dword                    v[0:1], v2, off glc
   s_waitcnt_vscnt                       null, 0
-  s_mov_b32                             ttmp7, m0
-  s_mov_b32                             m0, ttmp13
+  v_readfirstlane_b32                   ttmp15, v2
+  s_mov_b32                             ttmp14, m0
+  s_mov_b32                             m0, ttmp15
+  s_nop                                 0
   s_sendmsg                             sendmsg(MSG_INTERRUPT)
-  s_waitcnt                             lgkmcnt(0)
-  s_mov_b32                             m0, ttmp7
+  s_mov_b32                             m0, ttmp14
 
-  // --- Phase 9: Restore and exit ---
-.gfx11_restore_exit:
-  // Restore v2/v3 (saved in Phase 5)
-  v_writelane_b32                       v2, ttmp4, 0
-  v_writelane_b32                       v3, ttmp5, 0
-  s_branch                              .gfx11_restore_common
-
-.gfx11_lost_sample:
-  // Buffer full or overflow — v2/v3 were never clobbered
-
-.gfx11_restore_common:
-  // Restore v0/v1
+.gfx11_restore:
   v_writelane_b32                       v0, ttmp2, 0
   v_writelane_b32                       v1, ttmp3, 0
-  // Restore exec
-  s_mov_b64                             exec, ttmp[10:11]
+  v_writelane_b32                       v2, ttmp7, 0
+  s_mov_b64                             exec, ttmp[4:5]
 
 .pc_sampling_exit_gfx11:
 
