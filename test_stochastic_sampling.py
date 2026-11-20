@@ -50,13 +50,13 @@ def find_agent_info_csv(out_dir: Path) -> Path | None:
     return candidates[0] if candidates else None
 
 
-def has_gfx1151_agent(out_dir: Path) -> bool:
+def has_gfx115x_agent(out_dir: Path) -> bool:
     agent_info = find_agent_info_csv(out_dir)
     if agent_info is None:
         return False
 
     with agent_info.open() as f:
-        return any(row.get("Name") == "gfx1151" for row in csv.DictReader(f))
+        return any(row.get("Name") in ("gfx1150", "gfx1151") for row in csv.DictReader(f))
 
 
 def validate_decoded_metadata(csv_file: Path, allow_zero_wave_count: bool) -> tuple[bool, str]:
@@ -181,7 +181,7 @@ def main() -> int:
         print(f"Logs: {run_dir}")
         return 1
 
-    valid, summary = validate_decoded_metadata(csv_file, has_gfx1151_agent(OUT_DIR))
+    valid, summary = validate_decoded_metadata(csv_file, has_gfx115x_agent(OUT_DIR))
     if not valid:
         print(summary)
         print(f"Logs: {run_dir}")

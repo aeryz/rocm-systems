@@ -60,8 +60,8 @@ void KFDPCSamplingTest::TearDown() {
     ROUTINE_END
 }
 
-static bool IsGfx1151(const HsaNodeProperties *props) {
-    return props && GetGfxVersion(props) == 0x000b0501;
+static bool IsGfx115x(const HsaNodeProperties *props) {
+    return props && (GetGfxVersion(props) == 0x000b0500 || GetGfxVersion(props) == 0x000b0501);
 }
 
 static bool IsValidPcSamplingUnit(HSA_PC_SAMPLING_UNIT_INTERVAL units) {
@@ -136,8 +136,8 @@ TEST_F(KFDPCSamplingTest, Gfx1151HostTrapAndStochasticCapability) {
 
     const HsaNodeProperties *props = m_NodeInfo.GetNodeProperties(defaultGPUNode);
     ASSERT_NOTNULL(props);
-    if (!IsGfx1151(props)) {
-        LOG() << "Skipping test: default GPU node is not gfx1151." << std::endl;
+    if (!IsGfx115x(props)) {
+        LOG() << "Skipping test: default GPU node is not gfx1150 or gfx1151." << std::endl;
         return;
     }
 
@@ -147,12 +147,12 @@ TEST_F(KFDPCSamplingTest, Gfx1151HostTrapAndStochasticCapability) {
 
     const HsaPcSamplingInfo *hosttrap =
         FindPcSamplingMethod(samples, HSA_PC_SAMPLING_METHOD_KIND_HOSTTRAP_V1);
-    ASSERT_NOTNULL(hosttrap) << "gfx1151 missing HOSTTRAP_V1 PC sampling capability.";
+    ASSERT_NOTNULL(hosttrap) << "gfx115x missing HOSTTRAP_V1 PC sampling capability.";
     ValidatePcSamplingMethodInfo(*hosttrap);
 
     const HsaPcSamplingInfo *stochastic =
         FindPcSamplingMethod(samples, HSA_PC_SAMPLING_METHOD_KIND_STOCHASTIC_V1);
-    ASSERT_NOTNULL(stochastic) << "gfx1151 missing STOCHASTIC_V1 PC sampling capability.";
+    ASSERT_NOTNULL(stochastic) << "gfx115x missing STOCHASTIC_V1 PC sampling capability.";
     ValidatePcSamplingMethodInfo(*stochastic);
 
     TEST_END;

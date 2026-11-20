@@ -419,9 +419,9 @@ is_pc_sampling_method_supported(rocprofiler_pc_sampling_method_t method,
             else
                 return ROCPROFILER_STATUS_ERROR_INCOMPATIBLE_KERNEL;
         }
-        else if(agent_name.find("gfx1151") == 0)
+        else if(agent_name == "gfx1150" || agent_name == "gfx1151")
         {
-            // Enable host-trap PC sampling on gfx1151
+            // Enable host-trap PC sampling on gfx1150 and gfx1151
             if(pcs_ioctl_version >= PC_SAMPLING_IOCTL_COMPUTE_VERSION(0, 1))
                 return ROCPROFILER_STATUS_SUCCESS;
             else
@@ -459,9 +459,9 @@ is_pc_sampling_method_supported(rocprofiler_pc_sampling_method_t method,
             else
                 return ROCPROFILER_STATUS_ERROR_INCOMPATIBLE_KERNEL;
         }
-        else if(agent_name.find("gfx1151") == 0)
+        else if(agent_name == "gfx1150" || agent_name == "gfx1151")
         {
-            // 1.5 version enables stochastic PC sampling on gfx1151
+            // 1.5 version enables stochastic PC sampling on gfx1150 and gfx1151
             if(pcs_ioctl_version >= PC_SAMPLING_IOCTL_COMPUTE_VERSION(1, 5))
                 return ROCPROFILER_STATUS_SUCCESS;
             else
