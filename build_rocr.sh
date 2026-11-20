@@ -35,7 +35,7 @@ cmake --install "$BUILD_DIR"
 cmake -G Ninja -S "$SRC_DIR/rocrtst/suites/test_common" -B "$ROCRTST_BUILD_DIR" \
   "${COMMON_CMAKE_ARGS[@]}" \
   -DROCM_SYSTEMS_ROOT="$SCRIPT_DIR" \
-  -DTARGET_DEVICES=gfx1151 \
+  -DTARGET_DEVICES=gfx1150 \
   -DROCRTST_BLD_TYPE=Release
 cmake --build "$ROCRTST_BUILD_DIR"
 

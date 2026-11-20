@@ -8,7 +8,7 @@ CLANGXX="$ROCM_PATH/llvm/bin/clang++"
 
 "$CLANGXX" \
   -x hip \
-  --offload-arch=gfx1151 \
+  --offload-arch=gfx1150 \
   --rocm-path="$ROCM_PATH" \
   -I"$ROCM_PATH/include" \
   -L"$ROCM_PATH/lib" \
